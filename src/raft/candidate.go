@@ -1,9 +1,5 @@
 package raft
 
-import (
-	"log"
-)
-
 func (s *Server) broadVote() chan *VoteResponse {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -19,7 +15,7 @@ func (s *Server) broadVote() chan *VoteResponse {
 		}
 		go func(to string) {
 			req := &VoteRequest{term, s.name, lastLogTerm, lastLogIndex}
-			log.Printf("[DEBUG][%s][broadVote] peer = %s, term = %d\n", s.name, to, term)
+			s.logger.Debug.Printf("[%s][broadVote] peer = %s, term = %d\n", s.name, to, term)
 			resp := s.trans.sendVote(s.name, to, req)
 			responseChan <- resp
 		}(peer)
@@ -42,18 +38,18 @@ func (s *Server) candidateLoop() {
 		}
 		select {
 		case <-s.stopChan:
-			log.Printf("[INFO][%s][candidateLoop] go to stop\n", s.name)
+			s.logger.Info.Printf("[%s][candidateLoop] go to stop\n", s.name)
 			s.SetState(Stopped)
 			return
 
 		case resp := <-responseChan:
 			succ := s.processVoteResponse(resp)
-			log.Printf("[DEBUG][%s][candidateLoop] vote term = %d, vote result = %t\n", s.name, resp.term, succ)
+			s.logger.Debug.Printf("[%s][candidateLoop] vote term = %d, vote result = %t\n", s.name, resp.term, succ)
 			if succ {
 				votedNumber++
 			}
 			if votedNumber >= s.quorumSize() {
-				log.Printf("[INFO][%s][candidateLoop] term = %d, votedNumber = %d\n", s.name, s.raft.CurrentTerm, votedNumber)
+				s.logger.Info.Printf("[%s][candidateLoop] term = %d, votedNumber = %d\n", s.name, s.raft.CurrentTerm, votedNumber)
 				s.SetState(Leader)
 				s.observeChan <- &ElectMessage{Server: s.name, Term: s.raft.CurrentTerm}
 				return
@@ -69,7 +65,7 @@ func (s *Server) candidateLoop() {
 			msg.responseChan <- resp
 
 		case <-timeoutChan:
-			log.Printf("[INFO][%s][candidateLoop] go to vote again \n", s.name)
+			s.logger.Info.Printf("[%s][candidateLoop] go to vote again \n", s.name)
 			s.SetState(Candidate)
 			vote = true
 			votedNumber = 0

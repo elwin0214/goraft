@@ -1,9 +1,5 @@
 package raft
 
-import (
-	"log"
-)
-
 func (s *Server) followerLoop() {
 
 	reset := false
@@ -11,7 +7,7 @@ func (s *Server) followerLoop() {
 
 	for s.GetState() == Follower {
 		if reset {
-			log.Printf("[INFO][%s][followerLoop] reset timeout\n", s.name)
+			s.logger.Info.Printf("[%s][followerLoop] reset timeout\n", s.name)
 			timeoutChan = afterBetween(DefaultElectionTimeout, DefaultElectionTimeout*2)
 		}
 
@@ -30,9 +26,9 @@ func (s *Server) followerLoop() {
 			reset = resp.success
 			msg.responseChan <- resp
 		case resp := <-s.appendRespChan:
-			log.Printf("[INFO][%s][followerLoop] resp=%v, error=append response message\n", s.name, resp)
+			s.logger.Info.Printf("[%s][followerLoop] resp=%v, error=append response message\n", s.name, resp)
 		case <-timeoutChan:
-			log.Printf("[INFO][%s][followerLoop] convert to Candidate!\n", s.name)
+			s.logger.Info.Printf("[%s][followerLoop] convert to Candidate!\n", s.name)
 			s.SetState(Candidate)
 			return
 		}

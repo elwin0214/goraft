@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"log"
 	"sync"
 	"time"
 )
@@ -29,9 +28,9 @@ type Server struct {
 	mutex sync.Mutex
 	name  string
 
-	voteChan       chan *Message
-	appendChan     chan *Message
-	appendRespChan chan *AppendResponse
+	voteChan       chan *Message        // receive  requestvote
+	appendChan     chan *Message        // receive appendentity
+	appendRespChan chan *AppendResponse // receive appendentity response
 
 	stopChan    chan bool
 	observeChan chan interface{}
@@ -47,10 +46,13 @@ type Server struct {
 	trans Transporter
 
 	config *Config
+
+	logger Logger
 }
 
 func NewServer(name string, log *LogStore, raft *RaftState, config *Config, observeChan chan interface{}) *Server {
 	server := &Server{name: name, log: log, raft: raft}
+	server.logger.Init()
 	server.voteChan = make(chan *Message, 1024)
 	server.appendChan = make(chan *Message, 1024)
 	server.appendRespChan = make(chan *AppendResponse, 1024)
@@ -71,11 +73,10 @@ func NewServer(name string, log *LogStore, raft *RaftState, config *Config, obse
 }
 
 func (s *Server) addPeer(p string) {
-	log.Printf("[DEBUG][%s][addPeer] add peer %s\n", s.name, p)
 	s.peers[p] = &Peer{1, 0, make(chan *Message, 128)}
 }
 
-func (s *Server) Commit(index uint64) {
+func (s *Server) commit(index uint64) {
 	s.raft.CommitIndex = index
 	s.log.commit(index)
 	if s.raft.LastApplied < index {
@@ -120,11 +121,11 @@ func (s *Server) Start() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if s.state != Stopped {
-		log.Printf("[ERROR] %s state is started!", s.name)
+		s.logger.Error.Printf("%s state is started!", s.name)
 		return
 	}
 	s.state = Follower
-	log.Printf("[INFO] %s state is Follwer!", s.name)
+	s.logger.Info.Printf("%s state is Follwer!", s.name)
 	go s.loop()
 }
 
@@ -153,7 +154,7 @@ func (s *Server) handleVoteRequest(request *VoteRequest) *VoteResponse {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if request.term < s.raft.CurrentTerm {
-		log.Printf("[INFO][%s][handleVoteRequest] current term = %d, reject term = %d\n", s.name, s.raft.CurrentTerm, request.term)
+		s.logger.Info.Printf("[%s][handleVoteRequest] current term = %d, reject term = %d\n", s.name, s.raft.CurrentTerm, request.term)
 		return &VoteResponse{s.raft.CurrentTerm, false}
 	}
 
@@ -173,7 +174,7 @@ func (s *Server) handleVoteRequest(request *VoteRequest) *VoteResponse {
 		return &VoteResponse{s.raft.CurrentTerm, false}
 	}
 	s.raft.VotedFor = request.candidateId
-	log.Printf("[INFO][%s][handleVoteRequest] current term = %d, vote for = %s\n", s.name, s.raft.CurrentTerm, request.candidateId)
+	s.logger.Info.Printf("[%s][handleVoteRequest] current term = %d, vote for = %s\n", s.name, s.raft.CurrentTerm, request.candidateId)
 	return &VoteResponse{s.raft.CurrentTerm, true}
 }
 
@@ -197,7 +198,7 @@ func (s *Server) handleAppendRequest(request *AppendRequest) *AppendResponse {
 	lastLogTerm, lastLogIndex := s.log.getLast()
 	commitIndex := s.raft.CommitIndex
 	if request.term < s.raft.CurrentTerm {
-		log.Printf("[INFO][%s][handleAppendRequest]  response = false, term = %d, requset.term = %d\n", s.name, s.raft.CurrentTerm, request.term)
+		s.logger.Info.Printf("[%s][handleAppendRequest]  response = false, term = %d, requset.term = %d\n", s.name, s.raft.CurrentTerm, request.term)
 		return &AppendResponse{s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
 	}
 
@@ -212,13 +213,15 @@ func (s *Server) handleAppendRequest(request *AppendRequest) *AppendResponse {
 			s.raft.VotedFor = ""
 			s.state = Follower
 		} else if s.state == Leader {
-			log.Printf("[ERROR][%s][handleAppendRequest] another leader with same term[%d] was found!", s.name, request.term)
+			s.logger.Error.Printf("[%s][handleAppendRequest] another leader with same term[%d] was found!", s.name, request.term)
 		}
 	}
 
 	if request.prevLogIndex == lastLogIndex && request.prevLogTerm == lastLogTerm {
-		s.Commit(request.leaderCommit)
-		log.Printf("[INFO][%s][handleAppendRequest] response = true, match = true, term = %d, lastLog = [%d,%d], commit = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, request.leaderCommit)
+		if request.leaderCommit > 0 {
+			s.commit(request.leaderCommit)
+		}
+		s.logger.Info.Printf("[%s][handleAppendRequest] response = true, match = true, term = %d, lastLog = [%d,%d], commit = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, request.leaderCommit)
 		return &AppendResponse{s.name, s.raft.CurrentTerm, true, lastLogTerm, lastLogIndex, request.leaderCommit}
 	}
 
@@ -226,7 +229,7 @@ func (s *Server) handleAppendRequest(request *AppendRequest) *AppendResponse {
 	lastLogTerm, lastLogIndex = s.log.getLast()
 
 	if !result {
-		log.Printf("[INFO][%s][handleAppendRequest] response = false, truncate = false, term = %d, lastLog =[%d,%d]\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex)
+		s.logger.Info.Printf("[%s][handleAppendRequest] response = false, truncate = false, term = %d, lastLog =[%d,%d]\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex)
 		return &AppendResponse{s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
 	}
 	if len(request.entries) > 0 {
@@ -236,9 +239,12 @@ func (s *Server) handleAppendRequest(request *AppendRequest) *AppendResponse {
 
 	if request.leaderCommit > s.getCommitIndex() {
 		//	s.log.commit(min(request.leaderCommit, lastLogIndex))
-		s.Commit(min(request.leaderCommit, lastLogIndex))
+		toCommitIndex := min(request.leaderCommit, lastLogIndex)
+		if toCommitIndex > 0 {
+			s.commit(toCommitIndex)
+		}
 	}
 	commitIndex = s.raft.CommitIndex
-	log.Printf("[INFO][%s][handleAppendRequest] response = true, term = %d, lastLog = [%d,%d], append_entries = %d, commitIndex = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, len(request.entries), commitIndex)
+	s.logger.Info.Printf("[%s][handleAppendRequest] response = true, term = %d, lastLog = [%d,%d], append_entries = %d, commitIndex = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, len(request.entries), commitIndex)
 	return &AppendResponse{s.name, s.raft.CurrentTerm, true, lastLogTerm, lastLogIndex, commitIndex}
 }

@@ -8,11 +8,9 @@ import (
 func logMsg(data interface{}) {
 	switch msg := data.(type) {
 	case *ElectMessage:
-		//em := data.(*ElectMessage)
-		log.Printf("[INFO][Elect] leader = %s term = %d\n", msg.Server, msg.Term)
+		log.Printf("[MSG][Elect] leader = %s term = %d\n", msg.Server, msg.Term)
 	case *CommitMessage:
-		//cm := data.(*CommitMessage)
-		log.Printf("[INFO][Commit] server = %s term = %d commitIndex = %d\n", msg.Server, msg.Term, msg.CommitIndex)
+		log.Printf("[MSG][Commit] server = %s term = %d commitIndex = %d\n", msg.Server, msg.Term, msg.CommitIndex)
 	default:
 		log.Printf("unknown message")
 	}
@@ -65,14 +63,13 @@ func Test_ElectionHighTerm(t *testing.T) {
 	server1 := c.Get("server1")
 	server1.log.append(&LogEntry{1, 1, "1"})
 	server1.raft.CurrentTerm = 2
-	server1.Commit(1)
 	c.Start()
 	msg := <-observeChan
 	logMsg(msg)
 	c.Stop()
 }
 
-func Test_Append(t *testing.T) {
+func Test_AppendSync(t *testing.T) {
 	observeChan := make(chan interface{}, 16)
 	peers := make([]string, 3)
 	peers[0] = "server1"
@@ -83,8 +80,9 @@ func Test_Append(t *testing.T) {
 	msg := <-observeChan
 	logMsg(msg)
 	leader := c.GetLeader()
-	leader.sendCommand("get")
-	leader.sendCommand("set")
+	leader.sendCommandAsync("get")
+	leader.sendCommandAsync("set")
+	leader.sendCommandAsync("add")
 	for i := 0; i < 3; i++ {
 		msg = <-observeChan
 		logMsg(msg)

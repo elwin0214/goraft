@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"log"
 	"sort"
 	"time"
 )
@@ -9,7 +8,7 @@ import (
 func (s *Server) leaderLoop() {
 	ticker := time.Tick(DefaultHeartbeatInterval)
 	for s.GetState() == Leader {
-		log.Printf("[DEBUG][%s][leaderLoop] goto a loop", s.name)
+		s.logger.Debug.Printf("[%s][leaderLoop] goto a loop", s.name)
 		select {
 		case <-s.stopChan:
 			s.SetState(Stopped)
@@ -47,7 +46,7 @@ func (s *Server) handleAppendResponse(response *AppendResponse) bool {
 	if response.success {
 		s.peers[p].matchIndex = response.lastLogIndex
 		s.peers[p].nextIndex = response.lastLogIndex + 1
-		log.Printf("[INFO][%s][handleAppendResponse] append = true, peer = %s, matchIndex = %d, nextIndex = %d\n", s.name, p, s.peers[p].matchIndex, s.peers[p].nextIndex)
+		s.logger.Info.Printf("[%s][handleAppendResponse] append = true, peer = %s, matchIndex = %d, nextIndex = %d\n", s.name, p, s.peers[p].matchIndex, s.peers[p].nextIndex)
 
 		indexs := make(uint64Slice, 0, len(s.peers))
 
@@ -59,24 +58,27 @@ func (s *Server) handleAppendResponse(response *AppendResponse) bool {
 		}
 		indexs = append(indexs, s.raft.CommitIndex)
 		sort.Sort(indexs)
+		toCommitIndex := indexs[s.quorumSize()-1]
+		s.logger.Debug.Println(indexs)
+		entry := s.log.getEntry(toCommitIndex)
+		s.logger.Debug.Printf("[%s][handleAppendResponse] toCommitIndex=%d\n", s.name, toCommitIndex)
 
-		commitIndex := indexs[s.quorumSize()-1]
-		log.Println(indexs)
-		if commitIndex > s.raft.CommitIndex {
-			s.Commit(commitIndex)
+		if toCommitIndex > s.raft.CommitIndex && (nil != entry && s.raft.CurrentTerm == entry.term) {
+			s.commit(toCommitIndex)
+			s.logger.Info.Printf("[%s][handleAppendResponse] toCommitIndex = %d\n", s.name, toCommitIndex)
 		}
-		log.Printf("[INFO][%s][handleAppendResponse] commit = %d\n", s.name, commitIndex)
+
 		return true
 	} else {
 		s.peers[p].nextIndex--
 		s.peers[p].matchIndex = 0
-		log.Printf("[INFO][%s][handleAppendResponse] append = false, peer = %s, matchIndex = %d, nextIndex = %d\n", s.name, p, s.peers[p].matchIndex, s.peers[p].nextIndex)
+		s.logger.Info.Printf("[%s][handleAppendResponse] append = false, peer = %s, matchIndex = %d, nextIndex = %d\n", s.name, p, s.peers[p].matchIndex, s.peers[p].nextIndex)
 		s.sync(p)
 		return false
 	}
 }
 
-func (s *Server) sendCommand(command string) {
+func (s *Server) sendCommandAsync(command string) {
 
 	if s.GetState() != Leader {
 		return
@@ -106,7 +108,7 @@ func (s *Server) getAppendRequest(to string) *AppendRequest {
 }
 
 func (s *Server) sync(to string) {
-	log.Printf("[INFO][%s][sync], peer = %s\n", s.name, to)
+	s.logger.Info.Printf("[%s][sync], peer = %s\n", s.name, to)
 
 	go func(from string, to string) {
 		request := s.getAppendRequest(to)
