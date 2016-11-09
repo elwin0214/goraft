@@ -1,30 +1,35 @@
 package raft
 
 type Cluster struct {
-	servers []*Server
+	servers      []*Server
+	electionChan chan *ElectMessage
 }
 
-func NewCluster(peers []string, observeChan chan interface{}) *Cluster {
-	config := NewConfig(peers)
+func newCluster(peers []string) *Cluster {
+	config := newConfig(peers)
 	servers := make([]*Server, 0, len(config.peers))
 	channels := make(map[string]*Channel, len(config.peers))
-
+	electionChan := make(chan *ElectMessage, 16)
 	for _, p := range config.peers {
-		server := NewServer(p, NewLogStroe(), NewRaftState(), config, observeChan)
+		server := newServer(p, newLogStroe(), config, electionChan)
 		servers = append(servers, server)
-		channel := NewChannel(server.GetVoteChan(), server.GetAppendChan())
+		channel := newChannel(server.GetVoteChan(), server.GetAppendChan())
 		channels[p] = channel
 	}
 
-	trans := NewMemTransporter(channels)
+	trans := newMemTransporter(channels)
 	for _, server := range servers {
 		server.SetTransporter(trans)
 	}
-	return &Cluster{servers}
+	return &Cluster{servers, electionChan}
 }
 
 func (c *Cluster) GetServers() []*Server {
 	return c.servers
+}
+
+func (c *Cluster) waitElected() *ElectMessage {
+	return <-c.electionChan
 }
 
 func (c *Cluster) Get(name string) *Server {
@@ -38,7 +43,7 @@ func (c *Cluster) Get(name string) *Server {
 
 func (c *Cluster) GetLeader() *Server {
 	for _, server := range c.servers {
-		if server.GetState() == Leader {
+		if server.GetRole() == Leader {
 			return server
 		}
 	}

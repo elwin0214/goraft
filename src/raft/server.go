@@ -6,22 +6,26 @@ import (
 )
 
 const (
-	Stopped     = "stopped"
-	Initialized = "initialized"
-	Follower    = "follower"
-	Candidate   = "candidate"
-	Leader      = "leader"
+	Follower  = "follower"
+	Candidate = "candidate"
+	Leader    = "leader"
 )
 
 const (
 	DefaultHeartbeatInterval = 1000 * time.Millisecond
 	DefaultElectionTimeout   = 3000 * time.Millisecond
+	DefaultSendTimeout       = 10000 * time.Millisecond
 )
 
 type Peer struct {
+	mutex      sync.Mutex //   prevent the goroute for log replication from executing concurrently
 	nextIndex  uint64
 	matchIndex uint64
-	appendChan chan *Message
+}
+
+type Store interface {
+	apply(entry LogEntry)
+	reply(entry LogEntry)
 }
 
 type Server struct {
@@ -32,57 +36,101 @@ type Server struct {
 	appendChan     chan *Message        // receive appendentity
 	appendRespChan chan *AppendResponse // receive appendentity response
 
-	stopChan    chan bool
-	observeChan chan interface{}
-
-	commitIndex uint64
-	applyIndex  uint64
+	stopChan     chan bool
+	electionChan chan *ElectMessage // receive election message
 
 	peers map[string]*Peer
 
-	log   *LogStore
-	state string
-	raft  *RaftState
-	trans Transporter
-
+	trans  Transporter
 	config *Config
+
+	// protected by mutex
+	role      string
+	leaderId  string
+	raft      RaftState
+	log       *LogStore
+	persister *Persister
+	stop      bool
+	// for request
+	pendingRequest map[uint64]Request
+	store          Store
+
+	// for testing
+	testing         bool
+	electionTimeout int64
 
 	logger Logger
 }
 
-func NewServer(name string, log *LogStore, raft *RaftState, config *Config, observeChan chan interface{}) *Server {
-	server := &Server{name: name, log: log, raft: raft}
+// func (p *Peer) sync(s *Server) {
+// 	select {
+// 	case <-p.syncChan:
+// 		req := s.getAppendRequest(p.name)
+// 		resp := s.trans.sendAppend(s.name, p.name, req)
+// 		s.handleAppendResponse(resp)
+// 	case <-p.stopChan:
+// 		return
+// 	}
+// }
+
+func newServer(name string, log *LogStore, config *Config, electionChan chan *ElectMessage) *Server {
+	persister := &Persister{}
+	server := &Server{name: name, log: log, persister: persister, role: Follower, leaderId: "", stop: true, testing: false}
 	server.logger.Init()
 	server.voteChan = make(chan *Message, 1024)
 	server.appendChan = make(chan *Message, 1024)
 	server.appendRespChan = make(chan *AppendResponse, 1024)
 
 	server.stopChan = make(chan bool, 1)
-	server.observeChan = observeChan
+	server.electionChan = electionChan
 	server.peers = make(map[string]*Peer)
 
-	server.commitIndex = 0
-	server.applyIndex = 0
-
 	server.config = config
-	server.state = Stopped
 	for _, p := range server.config.peers {
 		server.addPeer(p)
 	}
+	server.raft = newRaftState()
+	server.log.setPersister(persister)
+
+	server.pendingRequest = make(map[uint64]Request, 1024)
 	return server
 }
 
 func (s *Server) addPeer(p string) {
-	s.peers[p] = &Peer{1, 0, make(chan *Message, 128)}
+	peer := new(Peer)
+	peer.nextIndex = 1
+	peer.matchIndex = 0
+	s.peers[p] = peer
 }
 
 func (s *Server) commit(index uint64) {
-	s.raft.CommitIndex = index
-	s.log.commit(index)
-	if s.raft.LastApplied < index {
-		s.raft.LastApplied = index
+	if s.raft.CommitIndex >= index {
+		return
 	}
-	s.observeChan <- &CommitMessage{Server: s.name, Term: s.raft.CurrentTerm, CommitIndex: s.raft.CommitIndex}
+	s.raft.CommitIndex = index
+	s.persist()
+	//s.electionChan <- &CommitMessage{Server: s.name, Term: s.raft.CurrentTerm, CommitIndex: s.raft.CommitIndex}
+	if s.raft.LastApplied >= index {
+		return
+	}
+	beforeIndex := s.raft.LastApplied
+	s.logger.Debug.Println(s.log.entries)
+	s.logger.Debug.Printf("[%s][commit] beforeIndex = %d, index = %d\n", s.name, beforeIndex, index)
+	entries := s.log.getRange(beforeIndex+1, index)
+	if len(entries) == 0 {
+		return
+	}
+	for _, entry := range entries {
+		if nil != s.store {
+			s.store.apply(entry)
+			s.store.reply(entry)
+		}
+		if _, ok := s.pendingRequest[entry.Index]; ok {
+			s.pendingRequest[entry.Index].reponseChan <- true
+		}
+	}
+	s.raft.LastApplied = index
+	s.persist()
 }
 
 func (s *Server) getCommitIndex() uint64 {
@@ -97,35 +145,61 @@ func (s *Server) GetAppendChan() chan *Message {
 	return s.appendChan
 }
 
-func (s *Server) GetObserveChan() chan interface{} {
-	return s.observeChan
-}
-
 func (s *Server) SetTransporter(trans Transporter) {
 	s.trans = trans
 }
 
-func (s *Server) GetState() string {
+func (s *Server) GetRole() string {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	return s.state
+	return s.role
 }
 
-func (s *Server) SetState(state string) {
+func (s *Server) SetRole(role string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	s.state = state
+	s.role = role
+	if role == Leader {
+		s.leaderId = s.name
+	}
+}
+
+func (s *Server) SetStop(stop bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.stop = stop
+}
+
+func (s *Server) GetState() (string, bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.role, s.stop
+}
+func (s *Server) GetRaftState() RaftState {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.raft
+}
+func (s *Server) recover() {
+	s.log.recover()
+	s.raft = s.persister.readRaft()
+}
+
+func (s *Server) persist() {
+	s.log.persist()
+	s.persister.writeRaft(s.raft)
 }
 
 func (s *Server) Start() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	if s.state != Stopped {
-		s.logger.Error.Printf("%s state is started!", s.name)
+	if !s.stop {
+		s.logger.Error.Printf("%s is started! %s ", s.name, s.role)
 		return
 	}
-	s.state = Follower
-	s.logger.Info.Printf("%s state is Follwer!", s.name)
+	s.stop = false
+	s.recover()
+	s.logger.Info.Printf("[%s][Start] role = %s", s.name, s.role)
 	go s.loop()
 }
 
@@ -134,14 +208,24 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) loop() {
-	for s.GetState() != Stopped {
-		switch s.state {
+	for true {
+		role, stop := s.GetState()
+		if stop {
+			return
+		}
+		switch role {
 		case Follower:
+			s.logger.Debug.Printf("[%s][loop] Follower role = %s %s", s.name, s.role, role)
 			s.followerLoop()
 		case Candidate:
+			s.logger.Debug.Printf("[%s][loop] Candidate role = %s", s.name, s.role)
 			s.candidateLoop()
 		case Leader:
+			s.logger.Debug.Printf("[%s][loop] Leader role = %s", s.name, s.role)
 			s.leaderLoop()
+		default:
+			s.logger.Error.Printf("[%s][loop] unknown role = %s", s.name, s.role)
+
 		}
 	}
 }
@@ -153,29 +237,38 @@ func (s *Server) quorumSize() int {
 func (s *Server) handleVoteRequest(request *VoteRequest) *VoteResponse {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	if s.stop {
+		return &VoteResponse{false, s.name, s.raft.CurrentTerm, false}
+	}
 	if request.term < s.raft.CurrentTerm {
 		s.logger.Info.Printf("[%s][handleVoteRequest] current term = %d, reject term = %d\n", s.name, s.raft.CurrentTerm, request.term)
-		return &VoteResponse{s.raft.CurrentTerm, false}
-	}
-
-	if request.term > s.raft.CurrentTerm {
-		s.raft.CurrentTerm = request.term
-		s.raft.VotedFor = ""
+		return &VoteResponse{true, s.name, s.raft.CurrentTerm, false}
 	}
 
 	if request.term == s.raft.CurrentTerm {
 		if "" != s.raft.VotedFor && request.candidateId != s.raft.VotedFor {
-			return &VoteResponse{s.raft.CurrentTerm, false}
+			return &VoteResponse{true, s.name, s.raft.CurrentTerm, false}
 		}
 	}
+	toPersist := false
+	if request.term > s.raft.CurrentTerm {
+		s.raft.CurrentTerm = request.term
+		s.raft.VotedFor = ""
+		toPersist = true
+	}
 
-	lastLogIndex, lastLogTerm := s.log.getLast()
+	lastLogTerm, lastLogIndex := s.log.getLast()
 	if (lastLogTerm == request.lastLogTerm && lastLogIndex > request.lastLogIndex) || lastLogTerm > request.lastLogTerm {
-		return &VoteResponse{s.raft.CurrentTerm, false}
+		if toPersist {
+			s.persist()
+		}
+		s.logger.Info.Printf("[%s][handleVoteRequest] current term = %d, last = [%d, %d], req.last = [%d, %d] vote = false \n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, request.lastLogTerm, request.lastLogIndex)
+		return &VoteResponse{true, s.name, s.raft.CurrentTerm, false}
 	}
 	s.raft.VotedFor = request.candidateId
+	s.persist()
 	s.logger.Info.Printf("[%s][handleVoteRequest] current term = %d, vote for = %s\n", s.name, s.raft.CurrentTerm, request.candidateId)
-	return &VoteResponse{s.raft.CurrentTerm, true}
+	return &VoteResponse{true, s.name, s.raft.CurrentTerm, true}
 }
 
 func (s *Server) processVoteResponse(resp *VoteResponse) bool {
@@ -187,6 +280,7 @@ func (s *Server) processVoteResponse(resp *VoteResponse) bool {
 
 	if resp.term > s.raft.CurrentTerm {
 		s.raft.CurrentTerm = resp.term
+		s.persist()
 	}
 
 	return false
@@ -197,54 +291,58 @@ func (s *Server) handleAppendRequest(request *AppendRequest) *AppendResponse {
 	defer s.mutex.Unlock()
 	lastLogTerm, lastLogIndex := s.log.getLast()
 	commitIndex := s.raft.CommitIndex
-	if request.term < s.raft.CurrentTerm {
-		s.logger.Info.Printf("[%s][handleAppendRequest]  response = false, term = %d, requset.term = %d\n", s.name, s.raft.CurrentTerm, request.term)
-		return &AppendResponse{s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
-	}
+	if s.stop {
+		return &AppendResponse{false, s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
 
+	}
+	if request.term < s.raft.CurrentTerm {
+		s.logger.Warn.Printf("[%s][handleAppendRequest] response = false, term = %d, requset.term = %d\n", s.name, s.raft.CurrentTerm, request.term)
+		return &AppendResponse{true, s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
+	}
+	toPersist := false
 	if request.term > s.raft.CurrentTerm {
 		s.raft.CurrentTerm = request.term
-		s.raft.LeaderId = request.leaderId
 		s.raft.VotedFor = ""
-		s.state = Follower
+		toPersist = true
+		s.leaderId = request.leaderId
+		s.role = Follower
+
 	} else {
-		if s.state == Candidate {
-			s.raft.LeaderId = request.leaderId
+		if s.role == Candidate {
+			s.leaderId = request.leaderId
 			s.raft.VotedFor = ""
-			s.state = Follower
-		} else if s.state == Leader {
-			s.logger.Error.Printf("[%s][handleAppendRequest] another leader with same term[%d] was found!", s.name, request.term)
+			toPersist = true
+			s.role = Follower
+		} else if s.role == Leader {
+			s.logger.Error.Printf("[%s][handleAppendRequest] it's impossible that another leader with same term[%d] was found!", s.name, request.term)
+
 		}
 	}
 
-	if request.prevLogIndex == lastLogIndex && request.prevLogTerm == lastLogTerm {
-		if request.leaderCommit > 0 {
-			s.commit(request.leaderCommit)
-		}
-		s.logger.Info.Printf("[%s][handleAppendRequest] response = true, match = true, term = %d, lastLog = [%d,%d], commit = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, request.leaderCommit)
-		return &AppendResponse{s.name, s.raft.CurrentTerm, true, lastLogTerm, lastLogIndex, request.leaderCommit}
-	}
+	s.logger.Trace.Printf("[%s][handleAppendRequest] prevLogTerm = %d, prevLogIndex = %d \n", s.name, request.prevLogTerm, request.prevLogIndex)
+	s.logger.Trace.Println(request)
 
-	result := s.log.truncate(request.prevLogTerm, request.prevLogIndex)
+	result, size := s.log.appendFromMatched(request.prevLogTerm, request.prevLogIndex, request.entries)
 	lastLogTerm, lastLogIndex = s.log.getLast()
 
 	if !result {
-		s.logger.Info.Printf("[%s][handleAppendRequest] response = false, truncate = false, term = %d, lastLog =[%d,%d]\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex)
-		return &AppendResponse{s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
-	}
-	if len(request.entries) > 0 {
-		s.log.appendList(request.entries)
-		lastLogTerm, lastLogIndex = s.log.getLast()
+		if toPersist {
+			s.persist()
+		}
+		s.logger.Error.Printf("[%s][handleAppendRequest] response = false, truncate = false, term = %d, lastLog =[%d,%d]\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex)
+		return &AppendResponse{true, s.name, s.raft.CurrentTerm, false, lastLogTerm, lastLogIndex, commitIndex}
 	}
 
 	if request.leaderCommit > s.getCommitIndex() {
-		//	s.log.commit(min(request.leaderCommit, lastLogIndex))
 		toCommitIndex := min(request.leaderCommit, lastLogIndex)
 		if toCommitIndex > 0 {
 			s.commit(toCommitIndex)
 		}
 	}
+	if toPersist {
+		s.persist()
+	}
 	commitIndex = s.raft.CommitIndex
-	s.logger.Info.Printf("[%s][handleAppendRequest] response = true, term = %d, lastLog = [%d,%d], append_entries = %d, commitIndex = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, len(request.entries), commitIndex)
-	return &AppendResponse{s.name, s.raft.CurrentTerm, true, lastLogTerm, lastLogIndex, commitIndex}
+	s.logger.Info.Printf("[%s][handleAppendRequest] response = true, term = %d, lastLog = [%d,%d], append_entries = %d, commitIndex = %d\n", s.name, s.raft.CurrentTerm, lastLogTerm, lastLogIndex, size, commitIndex)
+	return &AppendResponse{true, s.name, s.raft.CurrentTerm, true, lastLogTerm, lastLogIndex, commitIndex}
 }

@@ -1,24 +1,40 @@
 package raft
 
+import (
+	"time"
+)
+
 func (s *Server) followerLoop() {
 
 	reset := false
-	timeoutChan := afterBetween(DefaultElectionTimeout, DefaultElectionTimeout*2)
+	var timeoutChan <-chan time.Time
+	if s.testing {
+		timeoutChan = time.After(time.Duration(s.electionTimeout))
+	} else {
+		timeoutChan = afterBetween(DefaultElectionTimeout, DefaultElectionTimeout*2)
+	}
 
-	for s.GetState() == Follower {
+	for true {
+		role, stop := s.GetState()
+		if stop || role != Follower {
+			return
+		}
 		if reset {
 			s.logger.Info.Printf("[%s][followerLoop] reset timeout\n", s.name)
-			timeoutChan = afterBetween(DefaultElectionTimeout, DefaultElectionTimeout*2)
+			if s.testing {
+				timeoutChan = time.After(time.Duration(s.electionTimeout))
+			} else {
+				timeoutChan = afterBetween(DefaultElectionTimeout, DefaultElectionTimeout*2)
+			}
 		}
 
 		select {
 		case <-s.stopChan:
-			s.SetState(Stopped)
+			s.SetStop(true)
 			return
 		case msg := <-s.voteChan:
 			req := msg.request.(*VoteRequest)
 			resp := s.handleVoteRequest(req)
-			reset = resp.granted //todo
 			msg.responseChan <- resp
 		case msg := <-s.appendChan:
 			req := msg.request.(*AppendRequest)
@@ -26,10 +42,10 @@ func (s *Server) followerLoop() {
 			reset = resp.success
 			msg.responseChan <- resp
 		case resp := <-s.appendRespChan:
-			s.logger.Info.Printf("[%s][followerLoop] resp=%v, error=append response message\n", s.name, resp)
+			s.logger.Error.Printf("[%s][followerLoop] resp=%v, error=append response message\n", s.name, resp)
 		case <-timeoutChan:
 			s.logger.Info.Printf("[%s][followerLoop] convert to Candidate!\n", s.name)
-			s.SetState(Candidate)
+			s.SetRole(Candidate)
 			return
 		}
 	}

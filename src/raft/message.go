@@ -13,6 +13,8 @@ type VoteRequest struct {
 }
 
 type VoteResponse struct {
+	accept  bool // it is `false` if the target server is stop
+	server  string
 	term    uint64
 	granted bool
 }
@@ -22,12 +24,13 @@ type AppendRequest struct {
 	leaderId     string
 	prevLogIndex uint64
 	prevLogTerm  uint64
-	entries      []*LogEntry
+	entries      []LogEntry
 	leaderCommit uint64
 }
 
 type AppendResponse struct {
-	peer string
+	accept bool // it is `false` if the target server is stop
+	peer   string
 
 	term    uint64
 	success bool
@@ -37,11 +40,12 @@ type AppendResponse struct {
 	commitIndex  uint64
 }
 
+// message transporting between servers
 type Message struct {
 	from string
 	to   string
 	//heartbeat bool
-	request      interface{}
+	request      interface{} //VoteRequest or AppendRequest
 	responseChan chan interface{}
 }
 

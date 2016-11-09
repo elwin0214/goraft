@@ -5,12 +5,13 @@ type Transporter interface {
 	sendAppend(from string, to string, request *AppendRequest) *AppendResponse
 }
 
+// the vote channel and append channel of the server
 type Channel struct {
 	voteChan   chan *Message
 	appendChan chan *Message
 }
 
-func NewChannel(voteChan chan *Message, appendChan chan *Message) *Channel {
+func newChannel(voteChan chan *Message, appendChan chan *Message) *Channel {
 	return &Channel{voteChan, appendChan}
 }
 
@@ -18,7 +19,7 @@ type MemTransporter struct {
 	channels map[string]*Channel
 }
 
-func NewMemTransporter(channels map[string]*Channel) Transporter {
+func newMemTransporter(channels map[string]*Channel) Transporter {
 	return &MemTransporter{channels}
 }
 

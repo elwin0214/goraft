@@ -6,9 +6,8 @@ type RaftState struct {
 
 	CommitIndex uint64
 	LastApplied uint64
-	LeaderId    string
 }
 
-func NewRaftState() *RaftState {
-	return &RaftState{"", 0, 0, 0, ""}
+func newRaftState() RaftState {
+	return RaftState{"", 0, 0, 0}
 }

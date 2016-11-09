@@ -4,6 +4,6 @@ type Config struct {
 	peers []string
 }
 
-func NewConfig(peers []string) *Config {
+func newConfig(peers []string) *Config {
 	return &Config{peers}
 }
