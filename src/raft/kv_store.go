@@ -14,10 +14,6 @@ func (kv *KVStore) apply(entry LogEntry) {
 
 func (kv *KVStore) reply(entry LogEntry) {
 	cmd := entry.Cmd.(*Command)
-	kv.server.logger.Trace.Println(entry)
-	kv.server.logger.Trace.Println(cmd.Op)
-	kv.server.logger.Trace.Println(cmd.Key)
-	kv.server.logger.Trace.Println(kv.data[cmd.Key])
 	if cmd.Op == "get" {
 		cmd.Value = kv.data[cmd.Key]
 	}
