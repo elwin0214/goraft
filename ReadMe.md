@@ -34,3 +34,11 @@ Main features in [In Search of an Understandable Consensus Algorithm](https://ra
 >To avoid returning stale data for Read-only operations
 First each leader commit a blank no-op entry into the log at the start of its term.Second,a leader must check whether it has been de- posed before processing a read-only request
 
+
+## run the test
+
+```
+source env.sh
+make test
+ 
+```
